@@ -10,6 +10,14 @@ Examples:
     python run_checks.py draft-ietf-oauth-rfc8725bis-04
     python run_checks.py https://www.ietf.org/archive/id/draft-ietf-oauth-rfc8725bis-04.txt
     python run_checks.py ./my-draft.xml
+
+Content rules implemented here are drawn from:
+  - https://authors.ietf.org/required-content
+  - https://authors.ietf.org/recommended-content
+  - https://authors.ietf.org/language-and-style
+  - RFC 7322  (RFC Style Guide)
+  - RFC 2119  (BCP 14 keywords)
+  - RFC 8174  (BCP 14 keywords, uppercase clarification)
 """
 
 import sys
@@ -400,6 +408,298 @@ def run_ref_status_check(name):
 
 
 # ---------------------------------------------------------------------------
+# Step 6: Automated content checks
+# Rules: https://authors.ietf.org/required-content
+#        https://authors.ietf.org/recommended-content
+#        https://authors.ietf.org/language-and-style
+# ---------------------------------------------------------------------------
+
+# Title words that imply standards status — forbidden per
+# https://authors.ietf.org/language-and-style
+_STATUS_TITLE_WORDS = {
+    "standard", "proposed", "draft", "experimental",
+    "historic", "required", "recommended", "elective", "restricted",
+}
+
+# BCP 14 keywords (RFC 2119 / RFC 8174)
+_BCP14_KEYWORDS = re.compile(
+    r'\b(MUST(?:\s+NOT)?|SHALL(?:\s+NOT)?|SHOULD(?:\s+NOT)?'
+    r'|(?:NOT\s+)?REQUIRED|(?:NOT\s+)?RECOMMENDED|MAY|OPTIONAL)\b'
+)
+
+# Refs to RFC 2119 or RFC 8174 — see https://authors.ietf.org/language-and-style
+_BCP14_REF = re.compile(r'RFC\s*(?:2119|8174)', re.IGNORECASE)
+
+
+def _extract_text_and_meta(url=None, file_path=None):
+    """
+    Return the plain-text content of the draft plus a dict of header metadata.
+    For XML drafts we fetch the rendered text from /api/render/text.
+    For txt/md we read directly.
+    """
+    if file_path:
+        raw = Path(file_path).read_bytes()
+        name = Path(file_path).name
+        if name.endswith(".xml"):
+            resp = requests.post(
+                f"{AUTHOR_TOOLS_BASE}/api/render/text",
+                files={"file": (name, raw)},
+                timeout=120,
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                txt_url = result.get("url", "")
+                if txt_url:
+                    txt_resp = requests.get(txt_url, timeout=60)
+                    if txt_resp.status_code == 200:
+                        return txt_resp.text
+            # Fall back: just decode the XML bytes as text for regex scanning
+            return raw.decode("utf-8", errors="replace")
+        return raw.decode("utf-8", errors="replace")
+    elif url:
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        text = resp.text
+        # If it's XML, render to plaintext for easier parsing
+        if url.endswith(".xml"):
+            render_resp = requests.post(
+                f"{AUTHOR_TOOLS_BASE}/api/render/text",
+                files={"file": (Path(url).name, resp.content)},
+                timeout=120,
+            )
+            if render_resp.status_code == 200:
+                txt_url = render_resp.json().get("url", "")
+                if txt_url:
+                    txt_resp = requests.get(txt_url, timeout=60)
+                    if txt_resp.status_code == 200:
+                        return txt_resp.text
+        return text
+    return None
+
+
+def _parse_header_flags(text):
+    """
+    Scan the first ~100 lines for Obsoletes:/Updates: header fields.
+    Returns (obsoletes: bool, updates: bool, title: str, author_count: int).
+    Per RFC 7322 s4.1.2 and https://authors.ietf.org/required-content.
+    """
+    lines = text.splitlines()[:100]
+    header = "\n".join(lines)
+    obsoletes = bool(re.search(r'^Obsoletes\s*:', header, re.IGNORECASE | re.MULTILINE))
+    updates = bool(re.search(r'^Updates\s*:', header, re.IGNORECASE | re.MULTILINE))
+
+    title = ""
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not re.match(
+            r'(Network Working Group|Internet-Draft|Intended status|Expires|'
+            r'Obsoletes|Updates|Category|ISSN|Stream|Workgroup|[A-Z][a-z]+\.)',
+            stripped
+        ):
+            # Heuristic: first non-header-looking non-empty line is the title
+            title = stripped
+            break
+
+    # Count authors: lines with "Author" or "Editor" labels, or the Authors' Addresses section
+    author_count = len(re.findall(
+        r'^\s*(?:Author|Editor)s?\s*:', header, re.IGNORECASE | re.MULTILINE
+    ))
+    # Fallback: count email lines in the Authors' Addresses section (one per author)
+    addr_match = re.search(
+        r"Authors?['’]? Addresses?.*?(?=\n\S|\Z)", text, re.DOTALL | re.IGNORECASE
+    )
+    if addr_match:
+        emails = re.findall(r'\S+@\S+', addr_match.group())
+        author_count = max(author_count, len(emails))
+
+    return obsoletes, updates, title, author_count
+
+
+def run_content_checks(url=None, file_path=None):
+    """
+    Step 6: Automated content checks derived from IETF author guidelines.
+    Rules sourced from:
+      https://authors.ietf.org/required-content
+      https://authors.ietf.org/recommended-content
+      https://authors.ietf.org/language-and-style
+    """
+    section("STEP 6: Content checks")
+
+    text = _extract_text_and_meta(url=url, file_path=file_path)
+    if not text:
+        print("  Could not retrieve draft text — skipping content checks.")
+        return None
+
+    issues = []
+    notes = []
+
+    # --- Abstract checks (https://authors.ietf.org/required-content#abstract) ---
+    abstract_match = re.search(
+        r'Abstract\s*\n(.*?)(?=\n\s*\n\s*[A-Z][^\n]{3,}\n|\nTable of Contents|\n1\.)',
+        text, re.DOTALL | re.IGNORECASE
+    )
+    abstract_text = abstract_match.group(1).strip() if abstract_match else ""
+
+    if abstract_text:
+        word_count = len(abstract_text.split())
+        if word_count < 50:
+            issues.append(
+                f"Abstract is too short ({word_count} words; guideline: 50–150). "
+                "See https://authors.ietf.org/required-content#abstract"
+            )
+        elif word_count > 150:
+            issues.append(
+                f"Abstract is too long ({word_count} words; guideline: 50–150). "
+                "See https://authors.ietf.org/required-content#abstract"
+            )
+        else:
+            notes.append(f"Abstract length OK ({word_count} words).")
+
+        # Citations in abstract must be fully defined there
+        # https://authors.ietf.org/required-content#abstract
+        abstract_refs = re.findall(r'\[([A-Za-z][^\]]{0,40})\]', abstract_text)
+        if abstract_refs:
+            issues.append(
+                f"Abstract contains citation(s) {abstract_refs} — these must be "
+                "fully defined within the abstract itself. "
+                "See https://authors.ietf.org/required-content#abstract"
+            )
+    else:
+        issues.append("Could not locate Abstract section.")
+
+    # --- Obsoletes/Updates consistency
+    # https://authors.ietf.org/required-content#abstract
+    # https://authors.ietf.org/required-content#introduction
+    obsoletes, updates, title, author_count = _parse_header_flags(text)
+
+    if obsoletes or updates:
+        relation = "Obsoletes" if obsoletes else "Updates"
+        if abstract_text and not re.search(
+            r'\b(obsoletes?|updates?|replaces?)\b', abstract_text, re.IGNORECASE
+        ):
+            issues.append(
+                f"Header has '{relation}:' but the abstract does not mention it. "
+                "Required per https://authors.ietf.org/required-content#abstract"
+            )
+        # Check introduction too
+        intro_match = re.search(
+            r'\n1\.\s+Introduction.*?\n(?=\n[1-9]|\nTable of Contents)',
+            text, re.DOTALL | re.IGNORECASE
+        )
+        intro_text = intro_match.group() if intro_match else ""
+        if intro_text and not re.search(
+            r'\b(obsoletes?|updates?|replaces?)\b', intro_text, re.IGNORECASE
+        ):
+            issues.append(
+                f"Header has '{relation}:' but the Introduction does not mention it. "
+                "Required per https://authors.ietf.org/required-content#introduction"
+            )
+
+    # --- Title must not imply standards status
+    # https://authors.ietf.org/language-and-style#internet-drafts-are-not-rfcs
+    if title:
+        title_words = set(re.findall(r'\b\w+\b', title.lower()))
+        bad_words = title_words & _STATUS_TITLE_WORDS
+        if bad_words:
+            issues.append(
+                f"Title contains status-implying word(s): {sorted(bad_words)}. "
+                "See https://authors.ietf.org/language-and-style#internet-drafts-are-not-rfcs"
+            )
+
+    # --- Draft must not refer to itself as an RFC
+    # https://authors.ietf.org/language-and-style#internet-drafts-are-not-rfcs
+    self_rfc = re.findall(
+        r'\b(this RFC|this document is an RFC|draft RFC|this RFC specifies)\b',
+        text, re.IGNORECASE
+    )
+    if self_rfc:
+        issues.append(
+            f"Draft appears to refer to itself as an RFC ({len(self_rfc)} instance(s)). "
+            "See https://authors.ietf.org/language-and-style#internet-drafts-are-not-rfcs"
+        )
+
+    # --- BCP 14 keywords used without normative reference
+    # https://authors.ietf.org/language-and-style#use-of-bcp-14-terms
+    # RFC 2119, RFC 8174
+    if _BCP14_KEYWORDS.search(text):
+        if not _BCP14_REF.search(text):
+            issues.append(
+                "BCP 14 keywords (MUST/SHOULD/etc.) used but no reference to RFC 2119 or "
+                "RFC 8174 found. Required per https://authors.ietf.org/language-and-style"
+                "#use-of-bcp-14-terms"
+            )
+        else:
+            notes.append("BCP 14 keywords present with RFC 2119/8174 reference.")
+
+    # --- Weak "no security considerations" claim
+    # https://authors.ietf.org/required-content#security-considerations (RFC 3552)
+    sec_match = re.search(
+        r'Security Considerations\s*\n(.*?)(?=\n\s*\n\s*[A-Z0-9][^\n]{2,}\n|\Z)',
+        text, re.DOTALL | re.IGNORECASE
+    )
+    if sec_match:
+        sec_text = sec_match.group(1)
+        if re.search(
+            r'(no security (considerations|implications|issues)|'
+            r'does not (introduce|raise|have) (any |new )?security)',
+            sec_text, re.IGNORECASE
+        ):
+            issues.append(
+                "Security Considerations contains a 'no security considerations' claim — "
+                "this is rarely acceptable and will likely trigger an IESG review. "
+                "See https://authors.ietf.org/required-content#security-considerations "
+                "and RFC 3552."
+            )
+    else:
+        issues.append(
+            "Could not locate Security Considerations section. This section is mandatory. "
+            "See https://authors.ietf.org/required-content#security-considerations"
+        )
+
+    # --- Author count (RFC 7322 s4.1.1 / https://authors.ietf.org/required-content#authors-addresses)
+    if author_count > 5:
+        issues.append(
+            f"Detected {author_count} authors/editors — more than 5 requires stream "
+            "leadership approval. See https://authors.ietf.org/required-content"
+            "#authors-addresses and RFC 7322 s4.1.1."
+        )
+    elif author_count > 0:
+        notes.append(f"Author count: {author_count} (within the 5-author limit).")
+
+    # --- Implementation Status section: must include RFC Editor removal note
+    # https://authors.ietf.org/recommended-content#implementation-status (BCP 205)
+    impl_match = re.search(
+        r'Implementation Status\s*\n(.*?)(?=\n\s*\n\s*[A-Z0-9][^\n]{2,}\n|\Z)',
+        text, re.DOTALL | re.IGNORECASE
+    )
+    if impl_match:
+        impl_text = impl_match.group(1)
+        if not re.search(r'RFC Editor', impl_text, re.IGNORECASE):
+            issues.append(
+                "Implementation Status section found but missing a note to the RFC Editor "
+                "to remove it before publication. Required per "
+                "https://authors.ietf.org/recommended-content#implementation-status (BCP 205)."
+            )
+        else:
+            notes.append("Implementation Status section has RFC Editor removal note.")
+
+    # --- Report ---
+    if issues:
+        print(f"  Issues found ({len(issues)}):")
+        for issue in issues:
+            print(f"  ⚠️   {issue}")
+    else:
+        print("  ✅  No automated content issues found.")
+
+    if notes:
+        print()
+        for note in notes:
+            print(f"  ℹ️   {note}")
+
+    return {"issues": issues, "notes": notes}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -422,6 +722,11 @@ def main():
         "--skip-refs",
         action="store_true",
         help="Skip downref and reference status checks (requires datatracker access)",
+    )
+    parser.add_argument(
+        "--skip-content",
+        action="store_true",
+        help="Skip automated content checks (step 6)",
     )
     parser.add_argument(
         "--no-submit-check",
@@ -469,6 +774,12 @@ def main():
     else:
         print("\n  (ABNF check skipped)")
 
+    # Step 6: automated content checks
+    if not args.skip_content:
+        results["content"] = run_content_checks(url=url, file_path=file_path)
+    else:
+        print("\n  (Content checks skipped)")
+
     # Steps 4 & 5: datatracker-based ref checks (require a draft name)
     if not args.skip_refs and name:
         results["downref"] = run_downref_check(name)
@@ -503,6 +814,18 @@ def main():
         print("  ABNF   : ❌  Parse errors (see above)")
     else:
         print("  ABNF   : ✅  Valid")
+
+    content_result = results.get("content")
+    if args.skip_content:
+        print("  content: (skipped)")
+    elif content_result is None:
+        print("  content: (unavailable)")
+    else:
+        n_issues = len(content_result.get("issues") or [])
+        if n_issues:
+            print(f"  content: ⚠️  {n_issues} issue(s) (see above)")
+        else:
+            print("  content: ✅  Clean")
 
     if args.skip_refs or not name:
         print("  downref: (skipped)")
