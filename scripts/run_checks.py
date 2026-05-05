@@ -9,7 +9,7 @@ Usage:
 Examples:
     python run_checks.py draft-ietf-oauth-rfc8725bis-04
     python run_checks.py https://www.ietf.org/archive/id/draft-ietf-oauth-rfc8725bis-04.txt
-    python run_checks.py ./my-draft.xml --skip-iddiff
+    python run_checks.py ./my-draft.xml
 """
 
 import sys
@@ -22,11 +22,16 @@ try:
     import requests
 except ImportError:
     print("ERROR: 'requests' library not found. Install it with:")
-    print("  pip install requests --break-system-packages")
+    print("  pip install requests")
     sys.exit(1)
 
 AUTHOR_TOOLS_BASE = "https://author-tools.ietf.org"
 IETF_ARCHIVE_BASE = "https://www.ietf.org/archive/id"
+DATATRACKER_BASE = "https://datatracker.ietf.org"
+
+# std_level slugs that are lower maturity and trigger the downref rule (RFC 3967 / RFC 8067)
+# when cited normatively from a Standards Track or BCP document
+DOWNREF_LEVELS = {"inf", "exp", "historic"}
 
 
 # ---------------------------------------------------------------------------
@@ -215,50 +220,183 @@ def run_abnf_check(url=None, name=None):
     return {"found": True, "errors": errors, "abnf": result.get("abnf", "")}
 
 
-def run_iddiff(name):
-    """Step 4: diff against the previous version."""
-    section("STEP 4: iddiff (vs. previous version)")
-
-    match = re.match(r"^(.*-)(\d+)$", name)
-    if not match:
-        print("  Could not parse version number from draft name — skipping.")
-        return None
-
-    prefix, version_str = match.groups()
-    version = int(version_str)
-
-    if version == 0:
-        print("  This is version -00; no previous version to diff against.")
-        return None
-
-    prev_name = f"{prefix}{version - 1:02d}"
-    print(f"  Comparing {name}  ←→  {prev_name} ...")
-
+def _dt_get(path, params=None):
+    """GET from the datatracker API; return parsed JSON or None on error."""
     resp = requests.get(
-        f"{AUTHOR_TOOLS_BASE}/api/iddiff",
-        params={"doc_1": prev_name, "doc_2": name, "abdiff": "true"},
-        timeout=120,
+        f"{DATATRACKER_BASE}{path}",
+        params={"format": "json", **(params or {})},
+        timeout=30,
     )
-
     if resp.status_code == 200:
-        # abdiff output can be long — print a preview
-        lines = resp.text.splitlines()
-        changed = [l for l in lines if l.startswith(("OLD:", "NEW:"))]
-        print(f"  ✅  Diff produced ({len(lines)} lines, {len(changed)} changed lines).")
-        if changed[:10]:
-            print("  Sample changes:")
-            for l in changed[:10]:
-                print(f"    {l}")
-            if len(changed) > 10:
-                print(f"    … and {len(changed) - 10} more changed lines.")
-        return resp.text
-    else:
-        try:
-            err = resp.json().get("error", resp.text[:200])
-        except Exception:
-            err = resp.text[:200]
-        print(f"  Diff error {resp.status_code}: {err}")
+        return resp.json()
+    return None
+
+
+def _strip_version(name):
+    """Strip version suffix: draft-foo-bar-04 → draft-foo-bar."""
+    return re.sub(r"-\d{2}$", "", name) if re.match(r".*-\d{2}$", name) else name
+
+
+def _fetch_downref_registry():
+    """Return a set of RFC names (e.g. 'rfc6979') already in the downref registry."""
+    from html.parser import HTMLParser
+
+    class _Parser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.in_td = False
+            self.current = []
+            self.rfcs = set()
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "td":
+                self.in_td = True
+
+        def handle_endtag(self, tag):
+            if tag == "td":
+                text = "".join(self.current).strip().lower()
+                m = re.match(r"rfc\s*(\d+)", text)
+                if m:
+                    self.rfcs.add(f"rfc{m.group(1)}")
+                self.current = []
+                self.in_td = False
+
+        def handle_data(self, data):
+            if self.in_td:
+                self.current.append(data)
+
+    resp = requests.get(f"{DATATRACKER_BASE}/doc/downref/", timeout=30)
+    if resp.status_code != 200:
         return None
+    p = _Parser()
+    p.feed(resp.text)
+    return p.rfcs
+
+
+def run_downref_check(name):
+    """Step 4: check normative references for downrefs (RFC 3967 / RFC 8067)."""
+    section("STEP 4: Downref check")
+
+    base_name = _strip_version(name)
+    doc = _dt_get(f"/api/v1/doc/document/{base_name}/")
+    if not doc:
+        print(f"  Could not fetch document metadata from datatracker — skipping.")
+        return None
+
+    doc_id = doc["id"]
+    rels = _dt_get("/api/v1/doc/relateddocument/", {"source": doc_id, "limit": 100})
+    if not rels:
+        print("  Could not fetch reference data from datatracker — skipping.")
+        return None
+
+    normative = [
+        r["target"].split("/")[-2]
+        for r in rels["objects"]
+        if "refnorm" in r["relationship"]
+    ]
+
+    if not normative:
+        print("  No normative references found in datatracker.")
+        return {"downrefs": [], "not_in_registry": []}
+
+    print(f"  Fetching std_level for {len(normative)} normative reference(s)...")
+
+    registry = _fetch_downref_registry()
+    if registry is None:
+        print("  ⚠️  Could not fetch downref registry — will flag candidates without registry check.")
+
+    downrefs = []
+    not_in_registry = []
+    untracked = []
+
+    for ref_name in normative:
+        ref_doc = _dt_get(f"/api/v1/doc/document/{ref_name}/")
+        if not ref_doc:
+            untracked.append(ref_name)
+            continue
+        std_level_uri = ref_doc.get("std_level") or ""
+        std_level = std_level_uri.split("/")[-2] if std_level_uri else None
+        if std_level in DOWNREF_LEVELS:
+            downrefs.append((ref_name, std_level))
+            if registry is not None and ref_name not in registry:
+                not_in_registry.append((ref_name, std_level))
+
+    if downrefs:
+        print(f"\n  Normative refs at lower maturity level ({len(downrefs)}):")
+        for ref_name, level in downrefs:
+            in_reg = "" if registry is None else ("  [in registry]" if ref_name not in not_in_registry else "  ⚠️  NOT in downref registry")
+            print(f"    {ref_name}  ({level}){in_reg}")
+    else:
+        print("  ✅  No downrefs detected.")
+
+    if untracked:
+        print(f"\n  Not in datatracker (verify manually): {', '.join(untracked)}")
+
+    return {"downrefs": downrefs, "not_in_registry": not_in_registry, "untracked": untracked}
+
+
+def run_ref_status_check(name):
+    """Step 5: check that normative references to active drafts are publication-ready."""
+    section("STEP 5: Normative reference status")
+
+    base_name = _strip_version(name)
+    doc = _dt_get(f"/api/v1/doc/document/{base_name}/")
+    if not doc:
+        print("  Could not fetch document metadata from datatracker — skipping.")
+        return None
+
+    doc_id = doc["id"]
+    rels = _dt_get("/api/v1/doc/relateddocument/", {"source": doc_id, "limit": 100})
+    if not rels:
+        print("  Could not fetch reference data from datatracker — skipping.")
+        return None
+
+    normative_drafts = [
+        r["target"].split("/")[-2]
+        for r in rels["objects"]
+        if "refnorm" in r["relationship"]
+        and r["target"].split("/")[-2].startswith("draft-")
+    ]
+
+    if not normative_drafts:
+        print("  ✅  No normative references to active drafts.")
+        return {"unready": []}
+
+    print(f"  Checking {len(normative_drafts)} normative draft reference(s)...")
+    unready = []
+
+    for ref_name in normative_drafts:
+        ref_doc = _dt_get(f"/api/v1/doc/document/{ref_name}/")
+        if not ref_doc:
+            print(f"    ⚠️  {ref_name}: not found in datatracker")
+            unready.append((ref_name, "not found"))
+            continue
+        # Fetch human-readable state names
+        state_names = []
+        for state_uri in ref_doc.get("states", []):
+            state_id = state_uri.rstrip("/").split("/")[-1]
+            state = _dt_get(f"/api/v1/doc/state/{state_id}/")
+            if state:
+                state_names.append(state.get("name", state_id))
+        states_str = ", ".join(state_names) if state_names else "unknown"
+        # Flag anything not in an IESG-approved or RFC-editor queue state
+        approved_slugs = {"rfc", "pub", "rfced", "missref"}
+        state_slugs = set()
+        for state_uri in ref_doc.get("states", []):
+            state_id = state_uri.rstrip("/").split("/")[-1]
+            state = _dt_get(f"/api/v1/doc/state/{state_id}/")
+            if state:
+                state_slugs.add(state.get("slug", ""))
+        if not any(s in state_slugs for s in approved_slugs):
+            print(f"    ⚠️  {ref_name}: {states_str}")
+            unready.append((ref_name, states_str))
+        else:
+            print(f"    ✅  {ref_name}: {states_str}")
+
+    if not unready:
+        print("  ✅  All normative draft references appear publication-ready.")
+
+    return {"unready": unready}
 
 
 # ---------------------------------------------------------------------------
@@ -276,14 +414,14 @@ def main():
         help="Draft name, URL, or local file path",
     )
     parser.add_argument(
-        "--skip-iddiff",
-        action="store_true",
-        help="Skip the iddiff step",
-    )
-    parser.add_argument(
         "--skip-abnf",
         action="store_true",
         help="Skip ABNF extraction and parsing",
+    )
+    parser.add_argument(
+        "--skip-refs",
+        action="store_true",
+        help="Skip downref and reference status checks (requires datatracker access)",
     )
     parser.add_argument(
         "--no-submit-check",
@@ -331,13 +469,14 @@ def main():
     else:
         print("\n  (ABNF check skipped)")
 
-    # Step 4: iddiff
-    if not args.skip_iddiff and name:
-        results["iddiff"] = run_iddiff(name)
+    # Steps 4 & 5: datatracker-based ref checks (require a draft name)
+    if not args.skip_refs and name:
+        results["downref"] = run_downref_check(name)
+        results["ref_status"] = run_ref_status_check(name)
     elif not name:
-        print("\n  (iddiff skipped — draft name not available for local files)")
+        print("\n  (Downref and ref status checks skipped — draft name not available for local files)")
     else:
-        print("\n  (iddiff skipped)")
+        print("\n  (Downref and ref status checks skipped)")
 
     # Summary
     section("SUMMARY")
@@ -365,13 +504,30 @@ def main():
     else:
         print("  ABNF   : ✅  Valid")
 
-    iddiff_result = results.get("iddiff")
-    if iddiff_result:
-        print("  iddiff : ✅  Diff produced (see above)")
-    elif not args.skip_iddiff and name:
-        print("  iddiff : (unavailable — see above)")
+    if args.skip_refs or not name:
+        print("  downref: (skipped)")
+        print("  refstat: (skipped)")
     else:
-        print("  iddiff : (skipped)")
+        dr = results.get("downref") or {}
+        not_in_reg = dr.get("not_in_registry", [])
+        untracked = dr.get("untracked", [])
+        if not_in_reg:
+            print(f"  downref: ⚠️  {len(not_in_reg)} downref(s) not in registry (see above)")
+        elif untracked:
+            print(f"  downref: ⚠️  {len(untracked)} ref(s) untracked — verify manually")
+        elif dr.get("downrefs") is not None:
+            print("  downref: ✅  Clean")
+        else:
+            print("  downref: (unavailable)")
+
+        rs = results.get("ref_status") or {}
+        unready = rs.get("unready", [])
+        if unready:
+            print(f"  refstat: ⚠️  {len(unready)} normative draft ref(s) may not be ready")
+        elif rs.get("unready") is not None:
+            print("  refstat: ✅  Clean")
+        else:
+            print("  refstat: (unavailable)")
 
     print()
 

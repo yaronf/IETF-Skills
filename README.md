@@ -9,7 +9,8 @@ A Cowork skill that runs the standard IETF Internet-Draft prepublication checks 
 | 1 | **idnits** — boilerplate, line length, references, formatting | idnits (submission-check mode) |
 | 2 | **Full validation** — structural errors and warnings | xml2rfc + idnits |
 | 3 | **ABNF syntax** — extracts and validates any ABNF grammars | BAP |
-| 4 | **iddiff** — diff against the previous version of the draft | rfcdiff/iddiff |
+| 4 | **Downref check** — flags normative refs at lower maturity (RFC 3967/8067); checks downref registry | IETF Datatracker API |
+| 5 | **Ref status** — flags normative references to drafts that are not yet publication-ready | IETF Datatracker API |
 
 ## Installation as a Cowork skill
 
@@ -33,7 +34,7 @@ pip install requests
 python scripts/run_checks.py draft-ietf-oauth-rfc8725bis-04
 
 # Check a local file
-python scripts/run_checks.py ./my-draft.xml --skip-iddiff
+python scripts/run_checks.py ./my-draft.xml
 
 # Check by URL with maximum verbosity
 python scripts/run_checks.py https://www.ietf.org/archive/id/draft-ietf-oauth-rfc8725bis-04.txt --verbose 2
@@ -43,8 +44,8 @@ python scripts/run_checks.py https://www.ietf.org/archive/id/draft-ietf-oauth-rf
 
 | Flag | Effect |
 |---|---|
-| `--skip-iddiff` | Skip diff against previous version |
 | `--skip-abnf` | Skip ABNF extraction/parsing |
+| `--skip-refs` | Skip downref and reference status checks |
 | `--no-submit-check` | Run idnits in normal mode (not submission-check mode) |
 | `--verbose N` | idnits verbosity 0–2 (default 1) |
 
@@ -56,7 +57,7 @@ python scripts/run_checks.py https://www.ietf.org/archive/id/draft-ietf-oauth-rf
 
 ## How it works
 
-All checks are delegated to the [IETF Author Tools API](https://author-tools.ietf.org) — no local tool installation required. See [`references/api.md`](references/api.md) for the full API spec.
+All checks are delegated to the [IETF Author Tools API](https://author-tools.ietf.org) — no local IETF tool installation required (idnits, xml2rfc, and BAP all run server-side). See [`references/api.md`](references/api.md) for the full API spec.
 
 ## License
 
